@@ -1839,6 +1839,54 @@ async fn handle_event(
                 runtime.broadcast_event(payload);
             }
         }
+    } else if let Event::HistorySync(h) = event.as_ref() {
+        // RZDO fork: upstream waxum published history batches as `data: {}`. Publish one
+        // `history_message` per message (same shape as `message`), plus a small summary event.
+        let timestamp = chrono::Utc::now().timestamp();
+        let mut total = 0usize;
+        if let Some(hs) = h.get() {
+            for conv in hs.conversations.iter() {
+                for hm in conv.messages.iter() {
+                    let Some(wmi) = hm.message.as_option() else { continue };
+                    let Some(msg) = wmi.message.as_option() else { continue };
+                    let key = wmi.key.as_option();
+                    let chat = key.and_then(|k| k.remote_jid.clone()).unwrap_or_else(|| conv.id.clone().into());
+                    let (text, caption, message_type, media_mimetype) = extract_message_content(msg);
+                    let data = serde_json::json!({
+                        "chat": chat,
+                        "chat_name": conv.name,
+                        "message_id": key.and_then(|k| k.id.clone()),
+                        "is_from_me": key.and_then(|k| k.from_me).unwrap_or(false),
+                        "participant": wmi.participant.clone().or_else(|| key.and_then(|k| k.participant.clone())),
+                        "push_name": wmi.push_name,
+                        "timestamp": wmi.message_timestamp,
+                        "message_type": message_type,
+                        "text": text,
+                        "caption": caption,
+                        "media_mimetype": media_mimetype,
+                        "media": extract_media_metadata(msg),
+                        "location": extract_location(msg),
+                        "is_group": chat.ends_with("@g.us"),
+                    });
+                    let payload_value = serde_json::json!({
+                        "session_id": session_id, "event": "history_message", "timestamp": timestamp, "data": data,
+                    });
+                    if let Ok(payload) = serde_json::to_string(&payload_value) {
+                        state.publish_to_nats(session_id, "history_message", &payload).await;
+                        total += 1;
+                    }
+                }
+            }
+            let summary = serde_json::json!({
+                "session_id": session_id, "event": "history_sync", "timestamp": timestamp,
+                "data": {"sync_type": hs.sync_type, "chunk_order": hs.chunk_order, "progress": hs.progress,
+                         "conversations": hs.conversations.len(), "messages_published": total},
+            });
+            if let Ok(payload) = serde_json::to_string(&summary) {
+                state.publish_to_nats(session_id, "history_sync", &payload).await;
+                runtime.broadcast_event(payload);
+            }
+        }
     } else if let Ok(payload) = serde_json::to_string(&event_to_json(event.as_ref(), session_id)) {
         let event_type = get_event_type(event.as_ref());
         state

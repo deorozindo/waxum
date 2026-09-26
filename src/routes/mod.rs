@@ -549,6 +549,10 @@ fn session_routes() -> Router<AppState> {
                 .put(handlers::operations::set_auto_reconnect),
         )
         .route(
+            "/{session_id}/history/fetch",
+            post(handlers::history::fetch_history),
+        )
+        .route(
             "/{session_id}/history-sync",
             get(handlers::operations::get_history_sync).put(handlers::operations::set_history_sync),
         )

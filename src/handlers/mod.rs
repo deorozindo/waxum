@@ -36,6 +36,7 @@ pub mod events;
 pub mod fake_reply;
 pub mod groups;
 pub mod groups_management;
+pub mod history;
 pub mod info;
 pub mod labels;
 pub mod media;
