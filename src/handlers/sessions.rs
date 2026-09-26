@@ -1823,7 +1823,30 @@ async fn handle_event(
                 .await;
             let from_phone = resolve_jid_phone(&client, &im.info.source.sender).await;
             let chat_phone = resolve_jid_phone(&client, &im.info.source.chat).await;
-            let data = message_event_data(&im.message, &im.info, from_phone, chat_phone);
+            let mut data = message_event_data(&im.message, &im.info, from_phone, chat_phone);
+            if im.message.poll_update_message.is_set() {
+                match crate::handlers::poll_votes::claim_vote(
+                    &runtime.storage_path,
+                    &im.info.id.to_string(),
+                    &im.info.source.sender,
+                )
+                .await
+                {
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::warn!(session_id, %error, "could not deduplicate poll vote")
+                    }
+                    Ok(true) => {}
+                }
+                crate::handlers::poll_votes::enrich(
+                    &runtime.storage_path,
+                    &client,
+                    &im.message,
+                    &im.info.source.sender,
+                    &mut data,
+                )
+                .await;
+            }
             let payload_value = serde_json::json!({
                 "session_id": session_id,
                 "event": "message",

@@ -954,41 +954,69 @@ pub async fn execute_poll(
 ) -> Result<MessageResponse, ApiError> {
     let client = get_client(state, session_id)?;
     let to_jid = resolve_recipient_jid(client.clone(), parse_jid(&request.to)?).await;
-
-    let options: Vec<waproto::whatsapp::message::poll_creation_message::Option> = request
-        .options
-        .into_iter()
-        .map(
-            |name| waproto::whatsapp::message::poll_creation_message::Option {
-                option_name: Some(name),
-                ..Default::default()
-            },
-        )
-        .collect();
-
-    let message = waproto::whatsapp::Message {
-        poll_creation_message: MessageField::some(
-            waproto::whatsapp::message::PollCreationMessage {
-                name: Some(request.name),
-                options,
-                selectable_options_count: Some(request.selectable_count),
-                ..Default::default()
-            },
-        ),
-        ..Default::default()
-    };
+    let creator = client
+        .pn()
+        .ok_or(ApiError::NotConnected)?
+        .to_non_ad_string();
 
     if auto_presence_on_send() {
         show_typing_before_send(&client, &to_jid).await;
     }
 
-    let message_id = client
-        .send_message(to_jid.clone(), message.clone())
+    // The API uses zero for unlimited; the library expects the option count.
+    let selectable_count = if request.selectable_count == 0 {
+        request.options.len() as u32
+    } else {
+        request.selectable_count
+    };
+    let (result, secret) = client
+        .polls()
+        .create(
+            to_jid.clone(),
+            &request.name,
+            &request.options,
+            selectable_count,
+        )
         .await
-        .map(|r| r.message_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    crate::handlers::search::record_outgoing(state, session_id, &to_jid, &message, &message_id)
-        .await;
+        .map_err(|e| match e {
+            whatsapp_rust::PollError::InvalidPoll(reason) => ApiError::BadRequest(reason),
+            other => ApiError::Internal(other.to_string()),
+        })?;
+    let message_id = result.message_id;
+    let storage = &state
+        .get_session(session_id)
+        .ok_or(ApiError::NotConnected)?
+        .storage_path;
+    crate::handlers::poll_votes::save(
+        storage,
+        &message_id,
+        &crate::handlers::poll_votes::SentPoll {
+            name: request.name.clone(),
+            options: request.options,
+            chat: to_jid.to_string(),
+            creator,
+            message_secret: base64::engine::general_purpose::STANDARD.encode(secret),
+        },
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("poll sent but secret could not be stored: {e}")))?;
+    let indexed_poll = waproto::whatsapp::Message {
+        poll_creation_message_v3: MessageField::some(
+            waproto::whatsapp::message::PollCreationMessage {
+                name: Some(request.name),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+    crate::handlers::search::record_outgoing(
+        state,
+        session_id,
+        &to_jid,
+        &indexed_poll,
+        &message_id,
+    )
+    .await;
 
     Ok(MessageResponse {
         message_id,

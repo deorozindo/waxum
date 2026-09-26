@@ -45,6 +45,7 @@ pub mod mex;
 pub mod nats_handler;
 pub mod newsletter;
 pub mod operations;
+pub mod poll_votes;
 pub mod presence;
 pub mod privacy;
 pub mod schedule;
