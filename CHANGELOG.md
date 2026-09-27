@@ -1,5 +1,7 @@
 ## RZDO send limiter
 
+- Persist learned PN/LID identity and merge historical attempts; aggregate the configured captain aliases for one chat ceiling and cooldown.
+
 - Disable the RZDO production business-hour window by captain order: open=0, close=24, weekdays=7 for every chat and group.
 
 - Apply Monday–Saturday 08:00–19:00 America/Sao_Paulo to third parties and groups; permit only the configured private captain PN/LID chat 24/7 while retaining cooldowns and ceilings.

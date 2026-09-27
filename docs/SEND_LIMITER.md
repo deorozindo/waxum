@@ -6,6 +6,8 @@ All POST message send routes (including polls, media, reactions, edits, pins and
 
 Response: `{"status":"pending","schedule_id":"<uuid>","send_at":"<UTC time>"}`. This confirms durable enqueue, not WhatsApp delivery. Poll `GET /api/v1/sessions/{sid}/scheduled` and match `id` to `schedule_id`. Final status is `sent` with `message_id`, or `failed` with `error`. Webhooks and NATS publish `scheduled_sent` / `scheduled_failed`. Do not retry a send just because a 202 response has no `message_id`.
 
+Successful PN→LID lookups are persisted in the shared ledger. Historical PN attempts migrate to the canonical LID, so later phone fallbacks keep the same counters and cooldown. Known captain PN/LID aliases are also aggregated even before a lookup succeeds.
+
 The existing `scheduled_messages` database stores requests. A SQLite WAL ledger stores attempts, rolling hourly counters and sampled next-send times. Reservations use `BEGIN IMMEDIATE`: independent gateway processes must share `WAXUM_SEND_LEDGER_PATH` on the **same local Docker volume** to enforce per-chat limits across them. Keep both databases on persistent volumes. Never put the ledger on NFS. A standalone instance defaults to `<WHATSAPP_STORAGE_PATH>/send-ledger.sqlite`.
 
 Configuration is read at startup; invalid values fail startup. Change environment variables and recreate only the waxum service through the deployment manager. Defaults:

@@ -130,7 +130,7 @@ pub fn initialize() -> anyhow::Result<()> {
         path.to_str()
             .ok_or_else(|| anyhow::anyhow!("invalid ledger path"))?,
     )?;
-    sqlite_raw::exec_batch(&db.lock(), "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=10000; CREATE TABLE IF NOT EXISTS send_attempts (session TEXT NOT NULL, chat TEXT NOT NULL, at INTEGER NOT NULL, session_next INTEGER NOT NULL, chat_next INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS send_attempts_session ON send_attempts(session, at); CREATE INDEX IF NOT EXISTS send_attempts_chat ON send_attempts(chat, at);")?;
+    sqlite_raw::exec_batch(&db.lock(), "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=10000; CREATE TABLE IF NOT EXISTS send_attempts (session TEXT NOT NULL, chat TEXT NOT NULL, at INTEGER NOT NULL, session_next INTEGER NOT NULL, chat_next INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS send_attempts_session ON send_attempts(session, at); CREATE INDEX IF NOT EXISTS send_attempts_chat ON send_attempts(chat, at); CREATE TABLE IF NOT EXISTS chat_aliases (alias TEXT PRIMARY KEY, canonical TEXT NOT NULL);")?;
     let config = Config::from_env()?;
     LIMITER
         .set(Limiter { db, config })
@@ -149,6 +149,27 @@ fn deadline(now: i64, entries: &[(i64, i64)], cap: usize) -> i64 {
 }
 
 impl Limiter {
+    fn link_alias(&self, pn: &str, lid: &str) -> anyhow::Result<()> {
+        let conn = self.db.lock();
+        sqlite_raw::exec_batch(&conn, "BEGIN IMMEDIATE")?;
+        let result = (|| {
+            sqlite_raw::execute(&conn, "INSERT INTO chat_aliases VALUES (?, ?) ON CONFLICT(alias) DO UPDATE SET canonical=excluded.canonical", &[V::Text(pn.into()), V::Text(lid.into())])?;
+            sqlite_raw::execute(
+                &conn,
+                "UPDATE send_attempts SET chat=? WHERE chat=?",
+                &[V::Text(lid.into()), V::Text(pn.into())],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => sqlite_raw::exec_batch(&conn, "COMMIT"),
+            Err(e) => {
+                let _ = sqlite_raw::exec_batch(&conn, "ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     fn check(&self, session: &str, chat: &str, reserve: bool) -> anyhow::Result<(i64, bool)> {
         self.check_at(session, chat, reserve, Utc::now().timestamp())
     }
@@ -163,11 +184,27 @@ impl Limiter {
         let conn = self.db.lock();
         sqlite_raw::exec_batch(&conn, "BEGIN IMMEDIATE")?;
         let result = (|| {
+            let canonical = sqlite_raw::query(
+                &conn,
+                "SELECT canonical FROM chat_aliases WHERE alias=?",
+                &[V::Text(chat.into())],
+                |r| r.get_string(0).unwrap_or_default(),
+            )?;
+            let chat = canonical.first().map(String::as_str).unwrap_or(chat);
             let query = |column: &str, value: &str, next: &str| {
                 sqlite_raw::query(&conn, &format!("SELECT at, {next} FROM send_attempts WHERE {column} = ? AND (at > ? OR {next} > ?) ORDER BY at"), &[V::Text(value.into()), V::Int(now - 3600), V::Int(now)], |r| (r.get_int(0), r.get_int(1)))
             };
             let session_entries = query("session", session, "session_next")?;
-            let chat_entries = query("chat", chat, "chat_next")?;
+            let mut chat_entries = if self.config.captain_chats.iter().any(|s| s == chat) {
+                let mut entries = Vec::new();
+                for alias in &self.config.captain_chats {
+                    entries.extend(query("chat", alias, "chat_next")?);
+                }
+                entries
+            } else {
+                query("chat", chat, "chat_next")?
+            };
+            chat_entries.sort_unstable_by_key(|(at, _)| *at);
             let due = self.config.window(
                 deadline(now, &session_entries, self.config.session_hour).max(deadline(
                     now,
@@ -209,6 +246,16 @@ impl Limiter {
             }
         }
     }
+}
+
+pub async fn link_alias(pn: String, lid: String) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        LIMITER
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("send limiter not initialized"))?
+            .link_alias(&pn, &lid)
+    })
+    .await?
 }
 
 pub async fn due(session: &str, chat: &str, reserve: bool) -> anyhow::Result<(i64, bool)> {
@@ -258,7 +305,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.sqlite");
         let db = sqlite_raw::open(path.to_str().unwrap()).unwrap();
-        sqlite_raw::exec_batch(&db.lock(), "CREATE TABLE send_attempts (session TEXT, chat TEXT, at INTEGER, session_next INTEGER, chat_next INTEGER)").unwrap();
+        sqlite_raw::exec_batch(&db.lock(), "CREATE TABLE send_attempts (session TEXT, chat TEXT, at INTEGER, session_next INTEGER, chat_next INTEGER); CREATE TABLE chat_aliases (alias TEXT PRIMARY KEY, canonical TEXT NOT NULL)").unwrap();
         let limiter = Limiter {
             db,
             config: config(),
@@ -269,6 +316,7 @@ mod tests {
         assert!(limiter.check_at("s1", "a", true, now).unwrap().1);
         assert!(!limiter.check_at("s1", "b", true, now + 1).unwrap().1);
         assert!(!limiter.check_at("s2", "a", true, now + 1).unwrap().1);
+        assert!(!limiter.check_at("s2", "b", true, now + 1).unwrap().1);
         let due = limiter.check_at("s1", "a", false, now + 1).unwrap().0;
         assert!((now + 9..=now + 21).contains(&due));
         drop(limiter);
@@ -285,6 +333,36 @@ mod tests {
             config: capped,
         };
         assert!(limiter.check_at("s2", "a", false, due + 50).unwrap().0 >= due + 3601);
+        assert!(limiter.check_at("s2", "b", false, due + 50).unwrap().0 >= due + 3601);
+    }
+    #[test]
+    fn learned_pn_lid_link_merges_history_and_survives_fallback_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let db = sqlite_raw::open(path.to_str().unwrap()).unwrap();
+        sqlite_raw::exec_batch(&db.lock(), "CREATE TABLE send_attempts (session TEXT, chat TEXT, at INTEGER, session_next INTEGER, chat_next INTEGER); CREATE TABLE chat_aliases (alias TEXT PRIMARY KEY, canonical TEXT NOT NULL)").unwrap();
+        let mut c = config();
+        c.open = 0;
+        c.close = 24;
+        c.days = 7;
+        c.chat_hour = 1;
+        let limiter = Limiter {
+            db,
+            config: c.clone(),
+        };
+        let now = 100;
+        assert!(limiter.check_at("s1", "pn", true, now).unwrap().1);
+        limiter.link_alias("pn", "lid").unwrap();
+        let due = limiter.check_at("s2", "lid", false, now + 1).unwrap().0;
+        assert_eq!(due, now + 3601);
+        assert_eq!(limiter.check_at("s2", "pn", false, now + 1).unwrap().0, due);
+        drop(limiter);
+        let limiter = Limiter {
+            db: sqlite_raw::open(path.to_str().unwrap()).unwrap(),
+            config: c,
+        };
+        assert_eq!(limiter.check_at("s2", "pn", false, now + 1).unwrap().0, due);
+        assert!(limiter.check_at("s2", "lid", true, due).unwrap().1);
     }
     #[test]
     fn simulated_clock_cooldowns_and_rolling_ceiling() {

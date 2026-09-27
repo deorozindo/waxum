@@ -288,7 +288,7 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
             chat
         };
         let jid = crate::handlers::messages::parse_jid(chat).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let jid = crate::handlers::messages::resolve_recipient_jid(client, jid).await;
+        let jid = crate::handlers::messages::resolve_recipient_jid(client, jid).await?;
         let (next, _) =
             crate::send_limiter::due(&row.session_id, &jid.to_non_ad_string(), false).await?;
         if next > Utc::now().timestamp() {
