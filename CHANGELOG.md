@@ -1,6 +1,9 @@
 ## RZDO send limiter
 
+- Disable the RZDO production business-hour window by captain order: open=0, close=24, weekdays=7 for every chat and group.
+
 - Apply Monday–Saturday 08:00–19:00 America/Sao_Paulo to third parties and groups; permit only the configured private captain PN/LID chat 24/7 while retaining cooldowns and ceilings.
+- Configure a separate captain chat hourly ceiling (default 60), preserving other chats at 12 and session limits.
 - Queue all HTTP sends with 202 and existing scheduled status endpoints/events.
 - Enforce persistent session/chat cooldowns, rolling hourly ceilings and business hours at actual dispatch, including blasts and NATS.
 - Publish received mentioned_jids with the session's own PN/LID aliases.

@@ -13,6 +13,7 @@ pub struct Config {
     pub chat_max: i64,
     pub session_hour: usize,
     pub chat_hour: usize,
+    pub captain_hour: usize,
     pub open: u32,
     pub close: u32,
     pub days: u32,
@@ -35,6 +36,7 @@ impl Config {
             chat_max: number("WAXUM_SEND_CHAT_MAX_SECONDS", 20)?,
             session_hour: number("WAXUM_SEND_SESSION_PER_HOUR", 60)?.try_into()?,
             chat_hour: number("WAXUM_SEND_CHAT_PER_HOUR", 12)?.try_into()?,
+            captain_hour: number("WAXUM_SEND_CAPTAIN_PER_HOUR", 60)?.try_into()?,
             open: number("WAXUM_SEND_OPEN_HOUR", 8)?.try_into()?,
             close: number("WAXUM_SEND_CLOSE_HOUR", 19)?.try_into()?,
             days: number("WAXUM_SEND_WEEKDAYS", 6)?.try_into()?,
@@ -59,6 +61,7 @@ impl Config {
         anyhow::ensure!(
             c.session_hour > 0
                 && c.chat_hour > 0
+                && c.captain_hour > 0
                 && c.open < c.close
                 && c.close <= 24
                 && (1..=7).contains(&c.days),
@@ -71,6 +74,14 @@ impl Config {
             "captain window exception must contain only private PN/LID JIDs"
         );
         Ok(c)
+    }
+
+    fn chat_ceiling(&self, chat: &str) -> usize {
+        if self.captain_chats.iter().any(|s| s == chat) {
+            self.captain_hour
+        } else {
+            self.chat_hour
+        }
     }
 
     pub fn window(&self, now: i64, chat: &str) -> i64 {
@@ -161,7 +172,7 @@ impl Limiter {
                 deadline(now, &session_entries, self.config.session_hour).max(deadline(
                     now,
                     &chat_entries,
-                    self.config.chat_hour,
+                    self.config.chat_ceiling(chat),
                 )),
                 chat,
             );
@@ -234,6 +245,7 @@ mod tests {
             chat_max: 20,
             session_hour: 60,
             chat_hour: 12,
+            captain_hour: 60,
             open: 8,
             close: 19,
             days: 6,
@@ -267,7 +279,7 @@ mod tests {
         assert_eq!(limiter.check_at("s1", "a", false, now + 1).unwrap().0, due);
         assert!(limiter.check_at("s1", "a", true, due).unwrap().1);
         let mut capped = config();
-        capped.chat_hour = 1;
+        capped.captain_hour = 1;
         let limiter = Limiter {
             db: limiter.db,
             config: capped,
@@ -292,6 +304,7 @@ mod tests {
             chat_max: 20,
             session_hour: 60,
             chat_hour: 12,
+            captain_hour: 60,
             open: 8,
             close: 19,
             days: 6,
@@ -309,7 +322,10 @@ mod tests {
             c.window(utc("2026-09-28T21:59:59Z"), "third-party"),
             utc("2026-09-28T21:59:59Z")
         );
+        assert_eq!(c.chat_ceiling("third-party"), 12);
+        assert_eq!(c.chat_ceiling("100000000000000@g.us"), 12);
         for captain in &c.captain_chats {
+            assert_eq!(c.chat_ceiling(captain), 60);
             assert_eq!(c.window(sunday, captain), sunday);
             assert_eq!(
                 c.window(utc("2026-09-28T22:00:00Z"), captain),

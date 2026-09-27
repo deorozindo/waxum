@@ -1,5 +1,7 @@
 # Durable human-paced sends
 
+RZDO production has **no business-hour window**, by captain order on 2026-09-27. Both services configure WAXUM_SEND_OPEN_HOUR=0, WAXUM_SEND_CLOSE_HOUR=24, WAXUM_SEND_WEEKDAYS=7. All chats/groups can dispatch 24/7, still behind cooldowns and hourly ceilings. WAXUM_SEND_CAPTAIN_CHATS identifies the private captain PN/LID only for its separate 60/hour chat ceiling; other chats stay at 12/hour.
+
 All POST message send routes (including polls, media, reactions, edits, pins and revokes) and status reactions now return **202 Accepted**, for every session. No request option bypasses admission. Existing future `send_at` still works.
 
 Response: `{"status":"pending","schedule_id":"<uuid>","send_at":"<UTC time>"}`. This confirms durable enqueue, not WhatsApp delivery. Poll `GET /api/v1/sessions/{sid}/scheduled` and match `id` to `schedule_id`. Final status is `sent` with `message_id`, or `failed` with `error`. Webhooks and NATS publish `scheduled_sent` / `scheduled_failed`. Do not retry a send just because a 202 response has no `message_id`.
@@ -16,6 +18,7 @@ Configuration is read at startup; invalid values fail startup. Change environmen
 | WAXUM_SEND_CHAT_MAX_SECONDS | 20 |
 | WAXUM_SEND_SESSION_PER_HOUR | 60 |
 | WAXUM_SEND_CHAT_PER_HOUR | 12 |
+| WAXUM_SEND_CAPTAIN_PER_HOUR | 60 |
 | WAXUM_SEND_OPEN_HOUR | 8 |
 | WAXUM_SEND_CLOSE_HOUR | 19 (exclusive) |
 | WAXUM_SEND_WEEKDAYS | 6 (Monday through Saturday) |
@@ -23,7 +26,7 @@ Configuration is read at startup; invalid values fail startup. Change environmen
 | WAXUM_SEND_CAPTAIN_CHATS | empty, comma-separated canonical captain PN/LID JIDs |
 | WAXUM_SEND_LEDGER_PATH | persistent session directory/send-ledger.sqlite |
 
-Only the private captain chat configured by its canonical PN and resolved LID in WAXUM_SEND_CAPTAIN_CHATS can send 24/7. This is a permanent business-window exception explicitly authorized by the captain; both cooldowns and hourly ceilings still apply. Third parties and groups obey Monday–Saturday 08:00–19:00 and remain queued outside it. Default is no exempt chat; configure only the captain’s own aliases, never a group.
+WAXUM_SEND_CAPTAIN_CHATS identifies only the private captain chat by canonical PN and resolved LID. Its chat ceiling is WAXUM_SEND_CAPTAIN_PER_HOUR (default 60/hour), independently of other chats’ 12/hour ceiling. Both cooldowns and the session ceiling still apply. Default is no captain alias; configure only the captain’s own aliases, never a group. The aliases also bypass a restricted window if an operator configures one, but RZDO production disables that window for everyone through 0/24/7. Defaults below the production policy are library fallbacks; production explicitly overrides them.
 
 Each admission samples independent inclusive session/chat delays and persists them. Scheduler granularity can add delay; timestamps round conservatively by one second to avoid allowing a send less than eight seconds later. Hourly limits use a rolling hour, count attempts conservatively (including failures), and persist across restarts. Media preparation happens before admission; the protocol send itself is gated. Blasts and NATS use the same final gate. JetStream receives progress acknowledgements while a command waits, preventing timeout-driven redelivery during closed hours.
 
