@@ -1824,10 +1824,13 @@ async fn handle_event(
             let from_phone = resolve_jid_phone(&client, &im.info.source.sender).await;
             let chat_phone = resolve_jid_phone(&client, &im.info.source.chat).await;
             let mut data = message_event_data(&im.message, &im.info, from_phone, chat_phone);
+            let own_pn = client.pn().map(|jid| jid.to_non_ad_string());
+            let own_lid = client.lid().map(|jid| jid.to_non_ad_string());
+            expand_own_mention(&mut data, own_pn.as_deref(), own_lid.as_deref());
             if im.message.poll_update_message.is_set() {
                 match crate::handlers::poll_votes::claim_vote(
                     &runtime.storage_path,
-                    &im.info.id.to_string(),
+                    im.info.id.as_ref(),
                     &im.info.source.sender,
                 )
                 .await
@@ -1870,11 +1873,18 @@ async fn handle_event(
         if let Some(hs) = h.get() {
             for conv in hs.conversations.iter() {
                 for hm in conv.messages.iter() {
-                    let Some(wmi) = hm.message.as_option() else { continue };
-                    let Some(msg) = wmi.message.as_option() else { continue };
+                    let Some(wmi) = hm.message.as_option() else {
+                        continue;
+                    };
+                    let Some(msg) = wmi.message.as_option() else {
+                        continue;
+                    };
                     let key = wmi.key.as_option();
-                    let chat = key.and_then(|k| k.remote_jid.clone()).unwrap_or_else(|| conv.id.clone().into());
-                    let (text, caption, message_type, media_mimetype) = extract_message_content(msg);
+                    let chat = key
+                        .and_then(|k| k.remote_jid.clone())
+                        .unwrap_or_else(|| conv.id.clone());
+                    let (text, caption, message_type, media_mimetype) =
+                        extract_message_content(msg);
                     let data = serde_json::json!({
                         "chat": chat,
                         "chat_name": conv.name,
@@ -1895,7 +1905,9 @@ async fn handle_event(
                         "session_id": session_id, "event": "history_message", "timestamp": timestamp, "data": data,
                     });
                     if let Ok(payload) = serde_json::to_string(&payload_value) {
-                        state.publish_to_nats(session_id, "history_message", &payload).await;
+                        state
+                            .publish_to_nats(session_id, "history_message", &payload)
+                            .await;
                         total += 1;
                     }
                 }
@@ -1906,7 +1918,9 @@ async fn handle_event(
                          "conversations": hs.conversations.len(), "messages_published": total},
             });
             if let Ok(payload) = serde_json::to_string(&summary) {
-                state.publish_to_nats(session_id, "history_sync", &payload).await;
+                state
+                    .publish_to_nats(session_id, "history_sync", &payload)
+                    .await;
                 runtime.broadcast_event(payload);
             }
         }
@@ -2176,6 +2190,7 @@ fn message_event_data(
         "from_phone": from_phone,
         "chat": info.source.chat.to_string(),
         "chat_phone": chat_phone,
+        "mentioned_jids": message_context(msg).map(|ctx| ctx.mentioned_jid.clone()).unwrap_or_default(),
         "quoted_message_id": quoted_message_id,
         "quoted_sender_jid": quoted_sender_jid,
         "message_id": info.id.to_string(),
@@ -2328,45 +2343,33 @@ pub(crate) fn extract_message_content(
 /// every content type that the wire format actually attaches one to
 /// (confirmed against `contextInfo` fields in the whatsapp-rust proto,
 /// not merely the subset `extract_message_content` above branches on).
-pub(crate) fn extract_quoted_context(
-    msg: &waproto::whatsapp::Message,
-) -> Option<(String, Option<String>)> {
-    let ctx = msg
-        .extended_text_message
+fn expand_own_mention(data: &mut serde_json::Value, pn: Option<&str>, lid: Option<&str>) {
+    let Some(mentions) = data
+        .get_mut("mentioned_jids")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+    if mentions
+        .iter()
+        .any(|v| v.as_str().is_some_and(|s| Some(s) == pn || Some(s) == lid))
+    {
+        for jid in [pn, lid].into_iter().flatten() {
+            if !mentions.iter().any(|v| v.as_str() == Some(jid)) {
+                mentions.push(jid.into());
+            }
+        }
+    }
+}
+
+fn message_context(msg: &waproto::whatsapp::Message) -> Option<&waproto::whatsapp::ContextInfo> {
+    use wacore::proto_helpers::MessageExt;
+    let msg = msg.get_base_message();
+    msg.image_message
         .as_option()
         .and_then(|m| m.context_info.as_option())
         .or_else(|| {
-            msg.image_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
-            msg.video_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
-            msg.audio_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
-            msg.document_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
-            msg.sticker_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
             msg.contact_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
-            msg.contacts_array_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
@@ -2376,22 +2379,77 @@ pub(crate) fn extract_quoted_context(
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
+            msg.extended_text_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.document_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.audio_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.video_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.call
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.contacts_array_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
             msg.live_location_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.poll_creation_message
+            msg.template_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.poll_creation_message_v2
+            msg.sticker_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.poll_creation_message_v3
+            msg.group_invite_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.template_button_reply_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.product_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.list_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.order_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.list_response_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
@@ -2406,16 +2464,6 @@ pub(crate) fn extract_quoted_context(
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.list_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
-            msg.list_response_message
-                .as_option()
-                .and_then(|m| m.context_info.as_option())
-        })
-        .or_else(|| {
             msg.interactive_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
@@ -2426,25 +2474,111 @@ pub(crate) fn extract_quoted_context(
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.template_message
+            msg.poll_creation_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.template_button_reply_message
+            msg.request_phone_number_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.order_message
+            msg.poll_creation_message_v2
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
-            msg.product_message
+            msg.poll_creation_message_v3
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
-        })?;
+        })
+        .or_else(|| {
+            msg.ptv_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.message_history_bundle
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.event_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.newsletter_admin_invite_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.album_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.sticker_pack_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.poll_result_snapshot_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.rich_response_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.message_history_notice
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.poll_creation_message_v5
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.newsletter_follower_invite_message_v2
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.poll_result_snapshot_message_v3
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.poll_creation_message_v6
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.event_invite_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.split_payment_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            msg.music_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+}
+
+pub(crate) fn extract_quoted_context(
+    msg: &waproto::whatsapp::Message,
+) -> Option<(String, Option<String>)> {
+    let ctx = message_context(msg)?;
     let stanza_id = ctx.stanza_id.clone()?;
     Some((stanza_id, ctx.participant.clone()))
 }
@@ -2982,5 +3116,63 @@ mod tests {
         let result = unzip_directory(dst_path.to_str().unwrap(), &buf.into_inner());
         let err = result.expect_err("per-entry uncompressed size limit must be enforced");
         assert!(err.to_string().contains("per-file"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    use waproto::buffa::MessageField;
+    #[test]
+    fn text_media_reply_and_own_aliases() {
+        let context = waproto::whatsapp::ContextInfo {
+            mentioned_jid: vec!["5511000000000@s.whatsapp.net".into()],
+            stanza_id: Some("reply".into()),
+            ..Default::default()
+        };
+        let text = waproto::whatsapp::Message {
+            extended_text_message: MessageField::some(
+                waproto::whatsapp::message::ExtendedTextMessage {
+                    context_info: MessageField::some(context.clone()),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        let image = waproto::whatsapp::Message {
+            image_message: MessageField::some(waproto::whatsapp::message::ImageMessage {
+                context_info: MessageField::some(context),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for msg in [&text, &image] {
+            assert_eq!(
+                message_context(msg).unwrap().mentioned_jid,
+                vec!["5511000000000@s.whatsapp.net"]
+            );
+            assert_eq!(extract_quoted_context(msg).unwrap().0, "reply");
+        }
+        let mut data = serde_json::json!({"mentioned_jids": ["5511000000000@s.whatsapp.net"]});
+        expand_own_mention(
+            &mut data,
+            Some("5511000000000@s.whatsapp.net"),
+            Some("100000000000000@lid"),
+        );
+        assert_eq!(data["mentioned_jids"].as_array().unwrap().len(), 2);
+        expand_own_mention(
+            &mut data,
+            Some("5511000000000@s.whatsapp.net"),
+            Some("100000000000000@lid"),
+        );
+        assert_eq!(data["mentioned_jids"].as_array().unwrap().len(), 2);
+        let mut data = serde_json::json!({"mentioned_jids": ["100000000000000@lid"]});
+        expand_own_mention(
+            &mut data,
+            Some("5511000000000@s.whatsapp.net"),
+            Some("100000000000000@lid"),
+        );
+        assert_eq!(data["mentioned_jids"].as_array().unwrap().len(), 2);
+        assert!(message_context(&waproto::whatsapp::Message::default()).is_none());
     }
 }

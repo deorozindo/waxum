@@ -877,6 +877,7 @@ async fn async_main(worker_threads: usize, blocking_threads: usize) -> Result<()
         handlers::sessions::run_reconnect_watchdog(watchdog_state).await;
     });
 
+    waxum::send_limiter::initialize()?;
     let scheduler_state = state.clone();
     tokio::spawn(async move {
         handlers::schedule::run_scheduler(scheduler_state).await;

@@ -476,3 +476,40 @@ fn sqlite_row_to_scheduled(row: &sqlite_raw::Row) -> ScheduledRow {
         updated_at: row.get_string(9).unwrap_or_default(),
     }
 }
+
+/// Keep a throttled request pending without blocking other chats.
+pub async fn defer(
+    pool: &DbPool,
+    id: &str,
+    until: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    match pool {
+        DbPool::Postgres(pg) => {
+            pg.get().await?.execute("UPDATE scheduled_messages SET send_at = $1 WHERE id = $2 AND status = 'pending'", &[&until, &id]).await?;
+        }
+        DbPool::MySQL(my) => {
+            use mysql_async::prelude::*;
+            my.get_conn()
+                .await?
+                .exec_drop(
+                    "UPDATE scheduled_messages SET send_at = ? WHERE id = ? AND status = 'pending'",
+                    (fmt_utc(until), id),
+                )
+                .await?;
+        }
+        DbPool::SQLite(handle) => {
+            let id = id.to_string();
+            let until = fmt_utc(until);
+            sqlite_blocking(handle, move |conn| {
+                sqlite_raw::execute(
+                    conn,
+                    "UPDATE scheduled_messages SET send_at = ? WHERE id = ? AND status = 'pending'",
+                    &[SQ::Text(until), SQ::Text(id)],
+                )?;
+                Ok(())
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}

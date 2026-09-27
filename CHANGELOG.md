@@ -1,3 +1,10 @@
+## RZDO send limiter
+
+- Queue all HTTP sends with 202 and existing scheduled status endpoints/events.
+- Enforce persistent session/chat cooldowns, rolling hourly ceilings and business hours at actual dispatch, including blasts and NATS.
+- Publish received mentioned_jids with the session's own PN/LID aliases.
+- See docs/SEND_LIMITER.md for configuration and client migration.
+
 # Changelog
 
 All notable changes to **waxum** will be documented in this file.

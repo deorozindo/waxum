@@ -1,12 +1,5 @@
-//! Models for the scheduled-send feature.
-//!
-//! Every send endpoint accepts an optional `send_at` ISO-8601 UTC
-//! timestamp. When it lies in the future the handler parks the request
-//! body in the `scheduled_messages` table instead of sending, and the
-//! background scheduler (see [`crate::handlers::schedule`]) dispatches
-//! it once due. The types below cover the parked-row representation,
-//! the management-endpoint query/response shapes, and the unified send
-//! response that distinguishes an immediate send from a scheduled one.
+//! Models for durable send admission and its result/status API.
+//! HTTP sends always return a pending queue receipt; delivery is asynchronous.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -116,17 +109,12 @@ pub struct ScheduledFleetQuery {
     pub status: Option<String>,
 }
 
-/// Unified response returned by every send endpoint.
-///
-/// When the request carried no future `send_at` the message goes out
-/// immediately: `status` is `sent` and `message_id`, `timestamp` and
-/// `to` are populated — the same fields the endpoint returned before
-/// scheduling existed. When a future `send_at` was supplied the message
-/// is parked instead: `status` is `pending` and `schedule_id` /
-/// `send_at` identify the scheduler row.
+/// Send receipt. HTTP handlers enqueue and return `pending` plus
+/// `schedule_id` and `send_at`. Result lookup uses ScheduledListResponse.
+/// The sent constructor remains available to internal callers.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SendResponse {
-    /// `sent` when delivered immediately, `pending` when scheduled.
+    /// `pending` on HTTP acceptance; `sent` for internal completed responses.
     #[schema(example = "sent")]
     pub status: String,
 

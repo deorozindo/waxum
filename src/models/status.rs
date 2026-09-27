@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, serde::Serialize, Deserialize, ToSchema)]
 pub struct StatusReactionRequest {
     #[schema(example = "559999999999@s.whatsapp.net")]
     pub status_owner: String,

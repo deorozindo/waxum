@@ -56,5 +56,8 @@ pub async fn fetch_history(
         )
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(HistoryFetchResponse { requested: true, request_id: id }))
+    Ok(Json(HistoryFetchResponse {
+        requested: true,
+        request_id: id,
+    }))
 }

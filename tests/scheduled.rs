@@ -16,7 +16,6 @@ use chrono::{Duration, Utc};
 use common::{call, req_delete, req_get, req_json, Harness, TEST_TOKEN};
 use serde_json::json;
 
-use waxum::handlers::schedule::{should_schedule, SCHEDULE_GRACE};
 use waxum::models::messages::SendTextRequest;
 use waxum::models::schedule::{ScheduledStatus, SendResponse};
 use waxum::models::webhooks::WebhookEvent;
@@ -54,19 +53,6 @@ fn send_at_parses_iso8601_and_defaults_to_none() {
     }))
     .expect("deserialize without send_at");
     assert!(without.send_at.is_none());
-}
-
-#[test]
-fn should_schedule_only_beyond_grace_window() {
-    let now = Utc::now();
-    assert!(!should_schedule(now - Duration::seconds(60), now));
-    assert!(!should_schedule(now, now));
-    assert!(!should_schedule(now + SCHEDULE_GRACE, now));
-    assert!(should_schedule(
-        now + SCHEDULE_GRACE + Duration::seconds(1),
-        now
-    ));
-    assert!(should_schedule(now + Duration::hours(2), now));
 }
 
 #[test]
@@ -148,7 +134,7 @@ async fn future_send_at_parks_message_and_lists_it() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body["status"], "pending");
     let schedule_id = body["schedule_id"].as_str().expect("schedule_id");
     assert!(!schedule_id.is_empty());
@@ -199,7 +185,7 @@ async fn future_send_at_parks_message_and_lists_it() {
 }
 
 #[tokio::test]
-async fn past_send_at_falls_through_to_immediate_send() {
+async fn past_send_at_is_still_durably_queued() {
     let h = Harness::new().await;
     seed_session(&h, "sched-s-02").await;
 
@@ -218,14 +204,14 @@ async fn past_send_at_falls_through_to_immediate_send() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status, StatusCode::ACCEPTED);
 
     let (_, body) = call(
         &h.app,
         req_get("/api/v1/sessions/sched-s-02/scheduled", Some(TEST_TOKEN)),
     )
     .await;
-    assert_eq!(body["count"], 0);
+    assert_eq!(body["count"], 1);
 }
 
 #[tokio::test]
@@ -298,4 +284,47 @@ async fn scheduling_unknown_session_returns_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn all_send_kinds_queue_offline_and_survive_database_reopen() {
+    let h = Harness::new().await;
+    h.state
+        .session_manager()
+        .create_session("queued", Some("fixture"), "unused-fixture-storage")
+        .await
+        .unwrap();
+    for (endpoint, body) in [
+        ("text", json!({"to":"5511000000000", "text":"fixture"})),
+        (
+            "poll",
+            json!({"to":"5511000000000", "name":"fixture", "options":["A","B"], "selectable_count":1}),
+        ),
+        (
+            "react",
+            json!({"to":"5511000000000", "message_id":"fixture", "emoji":"ok"}),
+        ),
+    ] {
+        let (status, body) = call(
+            &h.app,
+            req_json(
+                Method::POST,
+                &format!("/api/v1/sessions/queued/messages/{endpoint}"),
+                Some(TEST_TOKEN),
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["status"], "pending");
+        assert!(body["schedule_id"].as_str().is_some());
+    }
+    let path = h._tmp.path().join("waxum.db");
+    let reopened = waxum::db::session::DbPool::SQLite(
+        waxum::db::sqlite_raw::open(path.to_str().unwrap()).unwrap(),
+    );
+    let rows = waxum::db::scheduled::list(&reopened, Some("queued"), Some("pending"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
 }

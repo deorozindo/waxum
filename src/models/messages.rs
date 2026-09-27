@@ -240,7 +240,7 @@ fn default_phone_type() -> String {
     "CELL".to_string()
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EditMessageRequest {
     #[schema(example = "559999999999@s.whatsapp.net")]
     pub to: String,
@@ -250,7 +250,7 @@ pub struct EditMessageRequest {
     pub text: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SendReactionRequest {
     #[schema(example = "559999999999@s.whatsapp.net")]
     pub to: String,
@@ -304,7 +304,7 @@ pub struct SendMessageRequest {
     pub text: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RevokeMessageRequest {
     #[schema(example = "559999999999@s.whatsapp.net")]
     pub to: String,
@@ -703,7 +703,7 @@ pub struct SendPaymentInviteRequest {
     pub send_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SendPinMessageRequest {
     #[schema(example = "559999999999@s.whatsapp.net")]
     pub chat: String,

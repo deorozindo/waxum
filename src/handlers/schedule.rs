@@ -1,24 +1,7 @@
-//! Scheduled send: park a message now, dispatch it later.
-//!
-//! Every send handler in [`crate::handlers::messages`] starts with a
-//! [`maybe_schedule`] guard. When the request carries a `send_at` further
-//! in the future than [`SCHEDULE_GRACE`] the guard stores the endpoint
-//! key plus the serialized request body in the `scheduled_messages`
-//! table (see [`crate::db::scheduled`]) and answers immediately with a
-//! `pending` [`SendResponse`]; otherwise the handler falls through to
-//! its `execute_*` twin and sends right away.
-//!
-//! [`run_scheduler`] is the background half: a `tokio::time::interval`
-//! loop (period from `SCHEDULER_POLL_MS`, default 1000 ms) that claims
-//! due rows (pending → sending), replays the stored body through the
-//! matching `execute_*` function via [`dispatch`], and settles the row
-//! as `sent` or `failed`, broadcasting `scheduled_sent` /
-//! `scheduled_failed` webhook events either way.
-//!
-//! Management endpoints:
-//! - `GET    /api/v1/sessions/{sid}/scheduled` — list for one session.
-//! - `DELETE /api/v1/sessions/{sid}/scheduled/{id}` — cancel a pending one.
-//! - `GET    /api/v1/scheduled` — fleet-wide list.
+//! Durable send queue, backed by the existing scheduled_messages table.
+//! All send handlers enqueue; the scheduler checks business hours and rate
+//! eligibility before dispatch. Results appear in the session scheduled
+//! endpoint, webhooks and NATS scheduled_sent / scheduled_failed events.
 
 use std::time::Duration;
 
@@ -38,24 +21,10 @@ use crate::models::schedule::{
 use crate::models::webhooks::WebhookEvent;
 use crate::state::AppState;
 
-/// Grace window around "now": a `send_at` at most this far in the
-/// future (or already in the past) sends immediately instead of
-/// round-tripping through the scheduler table.
-pub const SCHEDULE_GRACE: chrono::Duration = chrono::Duration::seconds(2);
-
-/// Max rows claimed and dispatched per scheduler tick.
+/// Max rows examined per scheduler tick. Deferred rows leave the due set.
 const DUE_BATCH_LIMIT: i64 = 50;
 
-/// Decide whether a requested `send_at` should park the message in the
-/// scheduler (`true`) or send immediately (`false`).
-pub fn should_schedule(send_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    send_at > now + SCHEDULE_GRACE
-}
-
-/// Schedule-guard shared by every send handler. Returns `Ok(None)` when
-/// the request should proceed down the immediate-send path (no
-/// `send_at`, or inside the grace window), `Ok(Some(response))` when
-/// the message was parked and the handler should answer right away.
+/// Park every send durably. The optional timestamp delays admission further.
 pub async fn maybe_schedule<T: serde::Serialize>(
     state: &AppState,
     session_id: &str,
@@ -63,15 +32,24 @@ pub async fn maybe_schedule<T: serde::Serialize>(
     request: &T,
     send_at: Option<DateTime<Utc>>,
 ) -> Result<Option<SendResponse>, ApiError> {
-    let Some(send_at) = send_at else {
-        return Ok(None);
-    };
-    if !should_schedule(send_at, Utc::now()) {
-        return Ok(None);
-    }
-    if state.get_session(session_id).is_none() {
+    let send_at = send_at.unwrap_or_else(Utc::now).max(Utc::now());
+    if state
+        .session_manager()
+        .get_session(session_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .is_none()
+    {
         return Err(ApiError::SessionNotFound(session_id.to_string()));
     }
+    let value = serde_json::to_value(request).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let chat = value
+        .get("to")
+        .or_else(|| value.get("chat"))
+        .or_else(|| value.get("status_owner"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("missing recipient".into()))?;
+    crate::handlers::messages::parse_jid(chat)?;
     let id = uuid::Uuid::new_v4().to_string();
     let body = serde_json::to_string(request)
         .map_err(|e| ApiError::Internal(format!("failed to serialize scheduled body: {e}")))?;
@@ -230,6 +208,26 @@ fn parse_stored_ts(s: &str) -> DateTime<Utc> {
 /// comes from `SCHEDULER_POLL_MS` (default 1000 ms); a failed tick is
 /// logged and the loop keeps going.
 pub async fn run_scheduler(state: AppState) {
+    match scheduled::list(state.session_manager().pool(), None, Some("sending")).await {
+        Ok(rows) => {
+            for row in rows {
+                if let Err(e) = scheduled::mark_failed(
+                    state.session_manager().pool(),
+                    &row.id,
+                    "delivery unknown after restart; not replayed to avoid duplicate",
+                )
+                .await
+                {
+                    tracing::error!("cannot settle interrupted send: {e}");
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("cannot recover send queue: {e}");
+            return;
+        }
+    }
     let poll_ms: u64 = std::env::var("SCHEDULER_POLL_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -252,6 +250,33 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
     let pool = state.session_manager().pool();
     let due = scheduled::due_pending(pool, DUE_BATCH_LIMIT).await?;
     for row in due {
+        let body: serde_json::Value = serde_json::from_str(&row.body)?;
+        let chat = body
+            .get("to")
+            .or_else(|| body.get("chat"))
+            .or_else(|| body.get("status_owner"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("queued send missing chat"))?;
+        let client = match crate::handlers::messages::get_client(state, &row.session_id) {
+            Ok(client) => client,
+            Err(_) => {
+                scheduled::defer(pool, &row.id, Utc::now() + chrono::Duration::seconds(30)).await?;
+                continue;
+            }
+        };
+        let chat = if row.endpoint == "status-react" {
+            "status@broadcast"
+        } else {
+            chat
+        };
+        let jid = crate::handlers::messages::parse_jid(chat).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let jid = crate::handlers::messages::resolve_recipient_jid(client, jid).await;
+        let (next, _) =
+            crate::send_limiter::due(&row.session_id, &jid.to_non_ad_string(), false).await?;
+        if next > Utc::now().timestamp() {
+            scheduled::defer(pool, &row.id, DateTime::from_timestamp(next, 0).unwrap()).await?;
+            continue;
+        }
         if !scheduled::claim(pool, &row.id).await? {
             continue;
         }
@@ -279,6 +304,9 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
                         &payload.to_string(),
                     )
                     .await;
+                state
+                    .publish_to_nats(&row.session_id, "scheduled_sent", &payload.to_string())
+                    .await;
             }
             Err(err) => {
                 if let Err(e) = scheduled::mark_failed(pool, &row.id, &err).await {
@@ -296,6 +324,9 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
                         WebhookEvent::ScheduledFailed.as_str(),
                         &payload.to_string(),
                     )
+                    .await;
+                state
+                    .publish_to_nats(&row.session_id, "scheduled_failed", &payload.to_string())
                     .await;
             }
         }
@@ -329,6 +360,14 @@ pub async fn dispatch(
         }};
     }
     match endpoint {
+        "status-react" => arm!(
+            crate::models::status::StatusReactionRequest,
+            crate::handlers::status::execute_status_reaction
+        ),
+        "revoke" => arm!(mm::RevokeMessageRequest, m::execute_revoke),
+        "react" => arm!(mm::SendReactionRequest, m::execute_react),
+        "edit" => arm!(mm::EditMessageRequest, m::execute_edit),
+        "pin" => arm!(mm::SendPinMessageRequest, m::execute_pin),
         "text" => arm!(mm::SendTextRequest, m::execute_text),
         "image" => arm!(mm::SendImageRequest, m::execute_image),
         "video" => arm!(mm::SendVideoRequest, m::execute_video),

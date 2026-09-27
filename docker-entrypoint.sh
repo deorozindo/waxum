@@ -19,4 +19,10 @@ if [ -n "${SQLITE_PATH:-}" ]; then
     chown -R waxum:waxum "$sqlite_dir"
 fi
 
+if [ -n "${WAXUM_SEND_LEDGER_PATH:-}" ]; then
+    ledger_dir=$(dirname "$WAXUM_SEND_LEDGER_PATH")
+    mkdir -p "$ledger_dir"
+    chown waxum:waxum "$ledger_dir"
+fi
+
 exec gosu waxum:waxum "$@"
