@@ -161,6 +161,10 @@ async fn init_sqlite(pool: &crate::db::session::SqlitePool) -> anyhow::Result<()
              ); \
              CREATE INDEX IF NOT EXISTS idx_token_sessions_session ON token_sessions(session_id);",
         )?;
+        let receipt_columns = sqlite_raw::query(conn, "PRAGMA table_info(scheduled_messages)", &[], |row| row.get_string(1).unwrap_or_default())?;
+        if !receipt_columns.iter().any(|name| name == "receipt_published") {
+            sqlite_raw::exec_batch(conn, "ALTER TABLE scheduled_messages ADD COLUMN receipt_published INTEGER NOT NULL DEFAULT 0")?;
+        }
         let existing_columns: HashSet<String> = sqlite_raw::query(
             conn,
             "PRAGMA table_info(messages)",
@@ -335,6 +339,7 @@ async fn init_postgres(pool: &deadpool_postgres::Pool) -> anyhow::Result<()> {
             &[],
         )
         .await?;
+    client.execute("ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS receipt_published INTEGER NOT NULL DEFAULT 0", &[]).await?;
     client
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_messages_due ON scheduled_messages(status, send_at)",
@@ -710,6 +715,7 @@ async fn init_mysql(pool: &mysql_async::Pool) -> anyhow::Result<()> {
     .await?;
 
     let migrations = [
+        "ALTER TABLE scheduled_messages ADD COLUMN receipt_published INT NOT NULL DEFAULT 0",
         "ALTER TABLE webhooks ADD COLUMN disabled_at VARCHAR(30) NULL",
         "ALTER TABLE webhooks ADD COLUMN disabled_reason TEXT NULL",
         "ALTER TABLE sessions MODIFY COLUMN is_logged_in INT NOT NULL DEFAULT 0",

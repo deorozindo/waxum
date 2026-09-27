@@ -151,6 +151,84 @@ pub async fn due_pending(pool: &DbPool, limit: i64) -> anyhow::Result<Vec<Schedu
     }
 }
 
+/// Earliest pending deadline, without loading the entire queue.
+pub async fn next_pending(pool: &DbPool) -> anyhow::Result<Option<ScheduledRow>> {
+    let query = format!("SELECT {COLS} FROM scheduled_messages WHERE status = 'pending' ORDER BY send_at ASC LIMIT 1");
+    match pool {
+        DbPool::Postgres(pg) => {
+            let client = pg.get().await?;
+            Ok(client
+                .query_opt(&query, &[])
+                .await?
+                .as_ref()
+                .map(pg_row_to_scheduled))
+        }
+        DbPool::MySQL(my) => {
+            use mysql_async::prelude::*;
+            let mut conn = my.get_conn().await?;
+            let row: Option<mysql_async::Row> = conn.query_first(query).await?;
+            Ok(row.as_ref().map(my_row_to_scheduled))
+        }
+        DbPool::SQLite(handle) => {
+            sqlite_blocking(handle, move |conn| {
+                Ok(sqlite_raw::query(conn, &query, &[], sqlite_row_to_scheduled)?.pop())
+            })
+            .await
+        }
+    }
+}
+
+/// Terminal rows keep an unpublished receipt until JetStream confirms persistence.
+pub async fn unpublished_receipts(pool: &DbPool) -> anyhow::Result<Vec<ScheduledRow>> {
+    let query = format!("SELECT {COLS} FROM scheduled_messages WHERE status IN ('sent','failed') AND receipt_published = 0 ORDER BY updated_at ASC LIMIT 50");
+    match pool {
+        DbPool::Postgres(pg) => {
+            let client = pg.get().await?;
+            Ok(client
+                .query(&query, &[])
+                .await?
+                .iter()
+                .map(pg_row_to_scheduled)
+                .collect())
+        }
+        DbPool::MySQL(my) => {
+            use mysql_async::prelude::*;
+            let mut conn = my.get_conn().await?;
+            let rows: Vec<mysql_async::Row> = conn.query(query).await?;
+            Ok(rows.iter().map(my_row_to_scheduled).collect())
+        }
+        DbPool::SQLite(handle) => {
+            sqlite_blocking(handle, move |conn| {
+                sqlite_raw::query(conn, &query, &[], sqlite_row_to_scheduled)
+            })
+            .await
+        }
+    }
+}
+
+/// Set this marker only after the terminal event receives a JetStream publish ACK.
+pub async fn mark_receipt_published(pool: &DbPool, id: &str) -> anyhow::Result<()> {
+    match pool {
+        DbPool::Postgres(pg) => {
+            let client = pg.get().await?;
+            client.execute("UPDATE scheduled_messages SET receipt_published = 1 WHERE id = $1 AND status IN ('sent','failed')", &[&id]).await?;
+        }
+        DbPool::MySQL(my) => {
+            use mysql_async::prelude::*;
+            let mut conn = my.get_conn().await?;
+            conn.exec_drop("UPDATE scheduled_messages SET receipt_published = 1 WHERE id = ? AND status IN ('sent','failed')", (id,)).await?;
+        }
+        DbPool::SQLite(handle) => {
+            let id = id.to_string();
+            sqlite_blocking(handle, move |conn| {
+                sqlite_raw::execute(conn, "UPDATE scheduled_messages SET receipt_published = 1 WHERE id = ? AND status IN ('sent','failed')", &[SQ::Text(id)])?;
+                Ok(())
+            }).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Atomically move a row from `pending` to `sending`. Returns false
 /// when the row was concurrently cancelled or already claimed, in
 /// which case the caller must skip it.

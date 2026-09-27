@@ -248,12 +248,18 @@ pub async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse
     let metric_families = reg.gather();
     let mut buf = Vec::new();
     match encoder.encode(&metric_families, &mut buf) {
-        Ok(()) => (
-            StatusCode::OK,
-            [("Content-Type", encoder.format_type().to_string())],
-            buf,
-        )
-            .into_response(),
+        Ok(()) => {
+            buf.extend_from_slice(format!(
+                "# TYPE waxum_scheduler_deadline_queries_total counter\nwaxum_scheduler_deadline_queries_total {}\n# TYPE waxum_scheduler_rounds_total counter\nwaxum_scheduler_rounds_total {}\n# TYPE waxum_scheduler_receipt_queries_total counter\nwaxum_scheduler_receipt_queries_total {}\n",
+                state.scheduler_count(0), state.scheduler_count(1), state.scheduler_count(2)
+            ).as_bytes());
+            (
+                StatusCode::OK,
+                [("Content-Type", encoder.format_type().to_string())],
+                buf,
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

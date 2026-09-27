@@ -63,6 +63,7 @@ pub async fn maybe_schedule<T: serde::Serialize>(
     )
     .await
     .map_err(|e| ApiError::Internal(format!("failed to store scheduled message: {e}")))?;
+    state.scheduler_wake().notify_one();
     Ok(Some(SendResponse::scheduled(id, send_at)))
 }
 
@@ -132,6 +133,7 @@ pub async fn cancel_scheduled(
             "scheduled message {id} was claimed by the scheduler; try again"
         )));
     }
+    state.scheduler_wake().notify_one();
     let row = scheduled::get(pool, &session_id, &id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -218,6 +220,7 @@ pub async fn recheck_pending(state: &AppState) -> anyhow::Result<()> {
         };
         scheduled::defer(pool, &row.id, requested).await?;
     }
+    state.scheduler_wake().notify_one();
     Ok(())
 }
 
@@ -239,6 +242,9 @@ pub async fn run_scheduler(state: AppState) {
                     tracing::error!("cannot settle interrupted send: {e}");
                     return;
                 }
+                if let Err(e) = webhook_without_nats(&state, &row.session_id, &row.id).await {
+                    tracing::warn!("interrupted send webhook failed: {e}");
+                }
             }
         }
         Err(e) => {
@@ -246,17 +252,122 @@ pub async fn run_scheduler(state: AppState) {
             return;
         }
     }
-    let poll_ms: u64 = std::env::var("SCHEDULER_POLL_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
-    let mut ticker = tokio::time::interval(Duration::from_millis(poll_ms));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    tracing::info!(poll_ms, "scheduled-send dispatcher started");
+    tracing::info!("scheduled-send dispatcher started with deadline timer");
     loop {
-        ticker.tick().await;
+        let retry_receipts = match publish_receipts(&state).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!("scheduled-send receipts failed: {e}");
+                true
+            }
+        };
+        let notified = state.scheduler_wake().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        state.count_scheduler(0);
+        let deadline = match scheduled::next_pending(state.session_manager().pool()).await {
+            Ok(Some(row)) => Some(parse_stored_ts(&row.send_at)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("scheduled-send deadline query failed: {e}");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+        let deadline = if retry_receipts {
+            Some(
+                deadline
+                    .unwrap_or(Utc::now() + chrono::Duration::seconds(30))
+                    .min(Utc::now() + chrono::Duration::seconds(30)),
+            )
+        } else {
+            deadline
+        };
+        match deadline {
+            Some(at) => {
+                let delay = (at - Utc::now()).to_std().unwrap_or_default();
+                tokio::select! {
+                    _ = &mut notified => continue,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            None => {
+                notified.await;
+                continue;
+            }
+        }
+        tracing::info!("scheduled-send deadline round");
         if let Err(e) = process_due(&state).await {
-            tracing::warn!("scheduled-send tick failed: {e}");
+            tracing::warn!("scheduled-send round failed: {e}");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+}
+
+fn terminal_receipt(row: &ScheduledRow) -> anyhow::Result<(WebhookEvent, String)> {
+    let event = if row.status == "sent" {
+        WebhookEvent::ScheduledSent
+    } else {
+        WebhookEvent::ScheduledFailed
+    };
+    let mut payload = serde_json::json!({
+        "schedule_id": row.id,
+        "endpoint": row.endpoint,
+        "send_at": row.send_at,
+    });
+    if row.status == "sent" {
+        payload["message_id"] = serde_json::json!(row.message_id);
+        let body: serde_json::Value = serde_json::from_str(&row.body)?;
+        payload["to"] = body
+            .get("to")
+            .or_else(|| body.get("chat"))
+            .or_else(|| body.get("status_owner"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    } else {
+        payload["error"] = serde_json::json!(row.error);
+    }
+    Ok((event, payload.to_string()))
+}
+
+async fn webhook_without_nats(state: &AppState, session_id: &str, id: &str) -> anyhow::Result<()> {
+    if state.nats().is_none() {
+        if let Some(row) = scheduled::get(state.session_manager().pool(), session_id, id).await? {
+            let (event, payload) = terminal_receipt(&row)?;
+            state
+                .broadcast_to_webhooks(session_id, event.as_str(), &payload)
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Publish terminal receipts from the existing queue ledger, including restart recovery.
+pub async fn publish_receipts(state: &AppState) -> anyhow::Result<bool> {
+    let Some(nats) = state.nats() else {
+        return Ok(false);
+    };
+    let pool = state.session_manager().pool();
+    loop {
+        state.count_scheduler(2);
+        let rows = scheduled::unpublished_receipts(pool).await?;
+        let full_batch = rows.len() == 50;
+        for row in rows {
+            let (event, payload) = terminal_receipt(&row)?;
+            crate::nats::publisher::publish_event_confirmed(
+                nats.jetstream(),
+                &row.session_id,
+                event.as_str(),
+                &payload,
+            )
+            .await?;
+            scheduled::mark_receipt_published(pool, &row.id).await?;
+            state
+                .broadcast_to_webhooks(&row.session_id, event.as_str(), &payload)
+                .await;
+        }
+        if !full_batch {
+            return Ok(false);
         }
     }
 }
@@ -266,6 +377,7 @@ pub async fn run_scheduler(state: AppState) {
 /// settle the row plus its webhook event.
 async fn process_due(state: &AppState) -> anyhow::Result<()> {
     let pool = state.session_manager().pool();
+    state.count_scheduler(1);
     let due = scheduled::due_pending(pool, DUE_BATCH_LIMIT).await?;
     for row in due {
         let body: serde_json::Value = serde_json::from_str(&row.body)?;
@@ -299,55 +411,10 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         match dispatch(state, &row.session_id, &row.endpoint, &row.body).await {
-            Ok(resp) => {
-                if let Err(e) = scheduled::mark_sent(pool, &row.id, &resp.message_id).await {
-                    tracing::warn!(
-                        "scheduled {} sent (message {}) but mark_sent failed: {}",
-                        row.id,
-                        resp.message_id,
-                        e
-                    );
-                }
-                let payload = serde_json::json!({
-                    "schedule_id": row.id,
-                    "endpoint": row.endpoint,
-                    "send_at": row.send_at,
-                    "message_id": resp.message_id,
-                    "to": resp.to,
-                });
-                state
-                    .broadcast_to_webhooks(
-                        &row.session_id,
-                        WebhookEvent::ScheduledSent.as_str(),
-                        &payload.to_string(),
-                    )
-                    .await;
-                state
-                    .publish_to_nats(&row.session_id, "scheduled_sent", &payload.to_string())
-                    .await;
-            }
-            Err(err) => {
-                if let Err(e) = scheduled::mark_failed(pool, &row.id, &err).await {
-                    tracing::warn!("scheduled {} failed and mark_failed failed: {}", row.id, e);
-                }
-                let payload = serde_json::json!({
-                    "schedule_id": row.id,
-                    "endpoint": row.endpoint,
-                    "send_at": row.send_at,
-                    "error": err,
-                });
-                state
-                    .broadcast_to_webhooks(
-                        &row.session_id,
-                        WebhookEvent::ScheduledFailed.as_str(),
-                        &payload.to_string(),
-                    )
-                    .await;
-                state
-                    .publish_to_nats(&row.session_id, "scheduled_failed", &payload.to_string())
-                    .await;
-            }
+            Ok(resp) => scheduled::mark_sent(pool, &row.id, &resp.message_id).await?,
+            Err(err) => scheduled::mark_failed(pool, &row.id, &err).await?,
         }
+        webhook_without_nats(state, &row.session_id, &row.id).await?;
     }
     Ok(())
 }

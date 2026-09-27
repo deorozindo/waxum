@@ -9,20 +9,34 @@ pub async fn publish_event(
     event_type: &str,
     payload: &str,
 ) {
+    if let Err(e) = publish_event_confirmed(jetstream, session_id, event_type, payload).await {
+        tracing::warn!("NATS event publish failed: {e}");
+    }
+}
+
+/// Return success only after JetStream persists the event.
+pub async fn publish_event_confirmed(
+    jetstream: &jetstream::Context,
+    session_id: &str,
+    event_type: &str,
+    payload: &str,
+) -> anyhow::Result<()> {
     let subject = format!("wa.events.{}.{}", session_id, event_type);
 
-    match jetstream
-        .publish(subject.clone(), Bytes::from(payload.to_string()))
-        .await
-    {
-        Ok(ack_future) => {
-            // Await the ack to ensure JetStream persisted the message
-            if let Err(e) = ack_future.await {
-                tracing::warn!("NATS JetStream ack failed for {}: {}", subject, e);
+    let mut headers = async_nats::HeaderMap::new();
+    if matches!(event_type, "scheduled_sent" | "scheduled_failed") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Some(id) = value.get("schedule_id").and_then(|id| id.as_str()) {
+                headers.insert(
+                    async_nats::header::NATS_MESSAGE_ID,
+                    format!("{subject}.{id}"),
+                );
             }
         }
-        Err(e) => {
-            tracing::warn!("Failed to publish event to NATS {}: {}", subject, e);
-        }
     }
+    jetstream
+        .publish_with_headers(subject, headers, Bytes::from(payload.to_string()))
+        .await?
+        .await?;
+    Ok(())
 }

@@ -504,6 +504,9 @@ struct AppStateInner {
 
     pub nats: Option<NatsManager>,
 
+    pub scheduler_wake: tokio::sync::Notify,
+    pub scheduler_counts: [std::sync::atomic::AtomicU64; 3],
+
     /// Where call recordings are read from / written to. Local
     /// filesystem by default; S3-compatible object storage when
     /// `S3_BUCKET` is configured. See [`crate::storage`].
@@ -614,6 +617,8 @@ impl AppState {
                 webhooks: DashMap::new(),
                 base_storage_path,
                 nats,
+                scheduler_wake: tokio::sync::Notify::new(),
+                scheduler_counts: Default::default(),
                 recordings,
                 webhook_circuits: DashMap::new(),
                 webhook_retry: WebhookRetryConfig::from_env(),
@@ -976,6 +981,18 @@ impl AppState {
             )
             .await;
         }
+    }
+
+    pub fn scheduler_count(&self, index: usize) -> u64 {
+        self.inner.scheduler_counts[index].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn count_scheduler(&self, index: usize) {
+        self.inner.scheduler_counts[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn scheduler_wake(&self) -> &tokio::sync::Notify {
+        &self.inner.scheduler_wake
     }
 
     pub fn session_manager(&self) -> &SessionManager {
