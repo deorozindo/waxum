@@ -12,7 +12,7 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
-use chrono::{Duration, Utc};
+use chrono::{Duration, Timelike, Utc};
 use common::{call, req_delete, req_get, req_json, Harness, TEST_TOKEN};
 use serde_json::json;
 
@@ -327,4 +327,40 @@ async fn all_send_kinds_queue_offline_and_survive_database_reopen() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 3);
+}
+
+#[tokio::test]
+async fn restart_rechecks_window_deferral_but_preserves_explicit_future() {
+    use waxum::db::scheduled;
+    let h = Harness::new().await;
+    let future = Utc::now() + Duration::days(3);
+    let future = future.with_nanosecond(0).unwrap();
+    for (id, body) in [
+        (
+            "window-deferred",
+            json!({"to":"5511000000000@s.whatsapp.net", "text":"a", "send_at":null}),
+        ),
+        (
+            "explicit-future",
+            json!({"to":"5511000000000@s.whatsapp.net", "text":"b", "send_at":future.to_rfc3339()}),
+        ),
+    ] {
+        scheduled::insert(&h.pool, id, "s", "text", &body.to_string(), future)
+            .await
+            .unwrap();
+    }
+    waxum::handlers::schedule::recheck_pending(&h.state)
+        .await
+        .unwrap();
+    let due = scheduled::due_pending(&h.pool, 50).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].id, "window-deferred");
+    let preserved = scheduled::get(&h.pool, "s", "explicit-future")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        preserved.send_at,
+        future.format("%Y-%m-%d %H:%M:%S").to_string()
+    );
 }

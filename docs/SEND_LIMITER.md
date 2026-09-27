@@ -20,13 +20,14 @@ Configuration is read at startup; invalid values fail startup. Change environmen
 | WAXUM_SEND_CLOSE_HOUR | 19 (exclusive) |
 | WAXUM_SEND_WEEKDAYS | 6 (Monday through Saturday) |
 | WAXUM_SEND_TIMEZONE | America/Sao_Paulo |
+| WAXUM_SEND_CAPTAIN_CHATS | empty, comma-separated canonical captain PN/LID JIDs |
 | WAXUM_SEND_LEDGER_PATH | persistent session directory/send-ledger.sqlite |
 
-Every chat, including the captain, obeys the same Monday–Saturday 08:00–19:00 business window. Outside it, requests remain queued. There are no recipient exemptions; the former WAXUM_SEND_CAPTAIN_CHATS setting is no longer supported.
+Only the private captain chat configured by its canonical PN and resolved LID in WAXUM_SEND_CAPTAIN_CHATS can send 24/7. This is a permanent business-window exception explicitly authorized by the captain; both cooldowns and hourly ceilings still apply. Third parties and groups obey Monday–Saturday 08:00–19:00 and remain queued outside it. Default is no exempt chat; configure only the captain’s own aliases, never a group.
 
 Each admission samples independent inclusive session/chat delays and persists them. Scheduler granularity can add delay; timestamps round conservatively by one second to avoid allowing a send less than eight seconds later. Hourly limits use a rolling hour, count attempts conservatively (including failures), and persist across restarts. Media preparation happens before admission; the protocol send itself is gated. Blasts and NATS use the same final gate. JetStream receives progress acknowledgements while a command waits, preventing timeout-driven redelivery during closed hours.
 
-Pending requests resume after restart. Rows interrupted in `sending` become `failed` with delivery-unknown error: they are retained and never automatically replayed, because a crash after WhatsApp accepts the packet cannot safely prove delivery or justify a duplicate. Reconciliation/retry is an operator choice. Preserve volumes when updating; do not export, logout, or DELETE sessions.
+Pending requests resume after restart. At startup their original requested send_at (or creation time when absent) is restored for a fresh admission check, so policy changes release prior business-window deferrals without overriding explicit future schedules. Rows interrupted in `sending` become `failed` with delivery-unknown error: they are retained and never automatically replayed, because a crash after WhatsApp accepts the packet cannot safely prove delivery or justify a duplicate. Reconciliation/retry is an operator choice. Preserve volumes when updating; do not export, logout, or DELETE sessions.
 
 ## Received mentions
 

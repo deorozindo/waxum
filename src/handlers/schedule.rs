@@ -204,10 +204,28 @@ fn parse_stored_ts(s: &str) -> DateTime<Utc> {
     DateTime::UNIX_EPOCH
 }
 
-/// Background dispatch loop, spawned once from `main`. The poll period
-/// comes from `SCHEDULER_POLL_MS` (default 1000 ms); a failed tick is
-/// logged and the loop keeps going.
+/// Restore original requested times so a new policy can recheck deferred rows.
+pub async fn recheck_pending(state: &AppState) -> anyhow::Result<()> {
+    let pool = state.session_manager().pool();
+    for row in scheduled::list(pool, None, Some("pending")).await? {
+        let body: serde_json::Value = serde_json::from_str(&row.body)?;
+        let requested = match body.get("send_at") {
+            Some(serde_json::Value::String(value)) => {
+                DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc)
+            }
+            None | Some(serde_json::Value::Null) => parse_stored_ts(&row.created_at),
+            _ => continue,
+        };
+        scheduled::defer(pool, &row.id, requested).await?;
+    }
+    Ok(())
+}
+
 pub async fn run_scheduler(state: AppState) {
+    if let Err(e) = recheck_pending(&state).await {
+        tracing::error!("cannot recheck pending queue: {e}");
+        return;
+    }
     match scheduled::list(state.session_manager().pool(), None, Some("sending")).await {
         Ok(rows) => {
             for row in rows {

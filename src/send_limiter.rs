@@ -17,6 +17,7 @@ pub struct Config {
     pub close: u32,
     pub days: u32,
     pub timezone: chrono_tz::Tz,
+    pub captain_chats: Vec<String>,
 }
 
 impl Config {
@@ -41,6 +42,12 @@ impl Config {
                 .unwrap_or_else(|_| "America/Sao_Paulo".into())
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid send timezone: {e}"))?,
+            captain_chats: std::env::var("WAXUM_SEND_CAPTAIN_CHATS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect(),
         };
         anyhow::ensure!(
             c.session_min > 0
@@ -57,10 +64,19 @@ impl Config {
                 && (1..=7).contains(&c.days),
             "invalid send ceilings/window"
         );
+        anyhow::ensure!(
+            c.captain_chats
+                .iter()
+                .all(|jid| jid.ends_with("@s.whatsapp.net") || jid.ends_with("@lid")),
+            "captain window exception must contain only private PN/LID JIDs"
+        );
         Ok(c)
     }
 
-    pub fn window(&self, now: i64) -> i64 {
+    pub fn window(&self, now: i64, chat: &str) -> i64 {
+        if self.captain_chats.iter().any(|s| s == chat) {
+            return now;
+        }
         let zone = self.timezone;
         let local = zone.timestamp_opt(now, 0).single().unwrap();
         if local.weekday().number_from_monday() <= self.days
@@ -147,6 +163,7 @@ impl Limiter {
                     &chat_entries,
                     self.config.chat_hour,
                 )),
+                chat,
             );
             if reserve && due <= now {
                 let mut rng = rand::thread_rng();
@@ -221,6 +238,7 @@ mod tests {
             close: 19,
             days: 6,
             timezone: chrono_tz::America::Sao_Paulo,
+            captain_chats: vec!["a".into(), "b".into()],
         }
     }
     #[test]
@@ -233,7 +251,7 @@ mod tests {
             db,
             config: config(),
         };
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-28T11:00:00Z")
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-27T12:00:00Z")
             .unwrap()
             .timestamp();
         assert!(limiter.check_at("s1", "a", true, now).unwrap().1);
@@ -266,8 +284,8 @@ mod tests {
         assert_eq!(deadline(40, &entries, 2), 3620);
     }
     #[test]
-    fn simulated_clock_commercial_window_for_every_chat() {
-        let c = Config {
+    fn simulated_clock_commercial_window_and_captain_24x7() {
+        let mut c = Config {
             session_min: 8,
             session_max: 20,
             chat_min: 8,
@@ -278,18 +296,34 @@ mod tests {
             close: 19,
             days: 6,
             timezone: chrono_tz::America::Sao_Paulo,
+            captain_chats: Vec::new(),
         };
+        c.captain_chats = vec![
+            "5511000000000@s.whatsapp.net".into(),
+            "100000000000000@lid".into(),
+        ];
         let utc = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
         let sunday = utc("2026-09-27T12:00:00Z");
-        assert_eq!(c.window(sunday), utc("2026-09-28T11:00:00Z"));
+        assert_eq!(c.window(sunday, "third-party"), utc("2026-09-28T11:00:00Z"));
         assert_eq!(
-            c.window(utc("2026-09-28T21:59:59Z")),
+            c.window(utc("2026-09-28T21:59:59Z"), "third-party"),
             utc("2026-09-28T21:59:59Z")
         );
-        let monday_open = utc("2026-09-28T11:00:00Z");
-        assert_eq!(c.window(monday_open), monday_open);
+        for captain in &c.captain_chats {
+            assert_eq!(c.window(sunday, captain), sunday);
+            assert_eq!(
+                c.window(utc("2026-09-28T22:00:00Z"), captain),
+                utc("2026-09-28T22:00:00Z")
+            );
+        }
         assert_eq!(
-            c.window(utc("2026-09-28T22:00:00Z")),
+            c.window(sunday, "100000000000000@g.us"),
+            utc("2026-09-28T11:00:00Z")
+        );
+        let monday_open = utc("2026-09-28T11:00:00Z");
+        assert_eq!(c.window(monday_open, "third-party"), monday_open);
+        assert_eq!(
+            c.window(utc("2026-09-28T22:00:00Z"), "third-party"),
             utc("2026-09-29T11:00:00Z")
         );
     }
