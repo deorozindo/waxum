@@ -17,13 +17,12 @@ Configuration is read at startup; invalid values fail startup. Change environmen
 | WAXUM_SEND_SESSION_PER_HOUR | 60 |
 | WAXUM_SEND_CHAT_PER_HOUR | 12 |
 | WAXUM_SEND_OPEN_HOUR | 8 |
-| WAXUM_SEND_CLOSE_HOUR | 20 (exclusive) |
+| WAXUM_SEND_CLOSE_HOUR | 19 (exclusive) |
 | WAXUM_SEND_WEEKDAYS | 6 (Monday through Saturday) |
 | WAXUM_SEND_TIMEZONE | America/Sao_Paulo |
-| WAXUM_SEND_CAPTAIN_CHATS | empty, comma-separated canonical PN/LID JIDs |
 | WAXUM_SEND_LEDGER_PATH | persistent session directory/send-ledger.sqlite |
 
-Only chats explicitly listed in `WAXUM_SEND_CAPTAIN_CHATS` bypass the business window. They still obey both cooldowns and hourly ceilings. Configure the captain's canonical phone JID and resolved LID. Ordinary recipients are never exempted for tests. The scheduler defers throttled requests so a closed chat does not block eligible captain traffic.
+Every chat, including the captain, obeys the same Monday–Saturday 08:00–19:00 business window. Outside it, requests remain queued. There are no recipient exemptions; the former WAXUM_SEND_CAPTAIN_CHATS setting is no longer supported.
 
 Each admission samples independent inclusive session/chat delays and persists them. Scheduler granularity can add delay; timestamps round conservatively by one second to avoid allowing a send less than eight seconds later. Hourly limits use a rolling hour, count attempts conservatively (including failures), and persist across restarts. Media preparation happens before admission; the protocol send itself is gated. Blasts and NATS use the same final gate. JetStream receives progress acknowledgements while a command waits, preventing timeout-driven redelivery during closed hours.
 

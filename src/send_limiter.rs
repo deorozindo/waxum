@@ -16,7 +16,6 @@ pub struct Config {
     pub open: u32,
     pub close: u32,
     pub days: u32,
-    pub captain_chats: Vec<String>,
     pub timezone: chrono_tz::Tz,
 }
 
@@ -36,18 +35,12 @@ impl Config {
             session_hour: number("WAXUM_SEND_SESSION_PER_HOUR", 60)?.try_into()?,
             chat_hour: number("WAXUM_SEND_CHAT_PER_HOUR", 12)?.try_into()?,
             open: number("WAXUM_SEND_OPEN_HOUR", 8)?.try_into()?,
-            close: number("WAXUM_SEND_CLOSE_HOUR", 20)?.try_into()?,
+            close: number("WAXUM_SEND_CLOSE_HOUR", 19)?.try_into()?,
             days: number("WAXUM_SEND_WEEKDAYS", 6)?.try_into()?,
             timezone: std::env::var("WAXUM_SEND_TIMEZONE")
                 .unwrap_or_else(|_| "America/Sao_Paulo".into())
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid send timezone: {e}"))?,
-            captain_chats: std::env::var("WAXUM_SEND_CAPTAIN_CHATS")
-                .unwrap_or_default()
-                .split(',')
-                .filter(|v| !v.trim().is_empty())
-                .map(|v| v.trim().to_string())
-                .collect(),
         };
         anyhow::ensure!(
             c.session_min > 0
@@ -67,10 +60,7 @@ impl Config {
         Ok(c)
     }
 
-    pub fn window(&self, now: i64, chat: &str) -> i64 {
-        if self.captain_chats.iter().any(|s| s == chat) {
-            return now;
-        }
+    pub fn window(&self, now: i64) -> i64 {
         let zone = self.timezone;
         let local = zone.timestamp_opt(now, 0).single().unwrap();
         if local.weekday().number_from_monday() <= self.days
@@ -157,7 +147,6 @@ impl Limiter {
                     &chat_entries,
                     self.config.chat_hour,
                 )),
-                chat,
             );
             if reserve && due <= now {
                 let mut rng = rand::thread_rng();
@@ -229,9 +218,8 @@ mod tests {
             session_hour: 60,
             chat_hour: 12,
             open: 8,
-            close: 20,
+            close: 19,
             days: 6,
-            captain_chats: vec!["a".into(), "b".into()],
             timezone: chrono_tz::America::Sao_Paulo,
         }
     }
@@ -245,17 +233,20 @@ mod tests {
             db,
             config: config(),
         };
-        assert!(limiter.check_at("s1", "a", true, 100).unwrap().1);
-        assert!(!limiter.check_at("s1", "b", true, 101).unwrap().1);
-        assert!(!limiter.check_at("s2", "a", true, 101).unwrap().1);
-        let due = limiter.check_at("s1", "a", false, 101).unwrap().0;
-        assert!((109..=121).contains(&due));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-28T11:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert!(limiter.check_at("s1", "a", true, now).unwrap().1);
+        assert!(!limiter.check_at("s1", "b", true, now + 1).unwrap().1);
+        assert!(!limiter.check_at("s2", "a", true, now + 1).unwrap().1);
+        let due = limiter.check_at("s1", "a", false, now + 1).unwrap().0;
+        assert!((now + 9..=now + 21).contains(&due));
         drop(limiter);
         let limiter = Limiter {
             db: sqlite_raw::open(path.to_str().unwrap()).unwrap(),
             config: config(),
         };
-        assert_eq!(limiter.check_at("s1", "a", false, 101).unwrap().0, due);
+        assert_eq!(limiter.check_at("s1", "a", false, now + 1).unwrap().0, due);
         assert!(limiter.check_at("s1", "a", true, due).unwrap().1);
         let mut capped = config();
         capped.chat_hour = 1;
@@ -275,7 +266,7 @@ mod tests {
         assert_eq!(deadline(40, &entries, 2), 3620);
     }
     #[test]
-    fn simulated_clock_commercial_window_and_captain() {
+    fn simulated_clock_commercial_window_for_every_chat() {
         let c = Config {
             session_min: 8,
             session_max: 20,
@@ -284,19 +275,21 @@ mod tests {
             session_hour: 60,
             chat_hour: 12,
             open: 8,
-            close: 20,
+            close: 19,
             days: 6,
-            captain_chats: vec!["captain".into()],
             timezone: chrono_tz::America::Sao_Paulo,
         };
         let utc = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
         let sunday = utc("2026-09-27T12:00:00Z");
-        assert_eq!(c.window(sunday, "chat"), utc("2026-09-28T11:00:00Z"));
-        assert_eq!(c.window(sunday, "captain"), sunday);
-        let monday_open = utc("2026-09-28T11:00:00Z");
-        assert_eq!(c.window(monday_open, "chat"), monday_open);
+        assert_eq!(c.window(sunday), utc("2026-09-28T11:00:00Z"));
         assert_eq!(
-            c.window(utc("2026-09-28T23:00:00Z"), "chat"),
+            c.window(utc("2026-09-28T21:59:59Z")),
+            utc("2026-09-28T21:59:59Z")
+        );
+        let monday_open = utc("2026-09-28T11:00:00Z");
+        assert_eq!(c.window(monday_open), monday_open);
+        assert_eq!(
+            c.window(utc("2026-09-28T22:00:00Z")),
             utc("2026-09-29T11:00:00Z")
         );
     }

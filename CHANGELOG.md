@@ -1,5 +1,6 @@
 ## RZDO send limiter
 
+- Apply Monday–Saturday 08:00–19:00 America/Sao_Paulo to every chat, including the captain, with no exception.
 - Queue all HTTP sends with 202 and existing scheduled status endpoints/events.
 - Enforce persistent session/chat cooldowns, rolling hourly ceilings and business hours at actual dispatch, including blasts and NATS.
 - Publish received mentioned_jids with the session's own PN/LID aliases.
